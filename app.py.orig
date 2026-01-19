@@ -1,0 +1,575 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
+
+from pipeline import config_store
+from pipeline.runner import cmd_to_str, run_py
+from pipeline.utils.open_folder import open_folder
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def list_images(folder: str) -> List[Path]:
+    p = Path(folder)
+    if not p.exists():
+        return []
+    out: List[Path] = []
+    for f in sorted(p.iterdir()):
+        if f.is_file() and f.suffix.lower() in IMG_EXTS:
+            out.append(f)
+    return out
+
+
+def read_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def show_cmd(title: str, res) -> None:
+    st.subheader(title)
+    st.code(cmd_to_str(res.cmd), language="bash")
+    if res.stdout.strip():
+        st.text_area("stdout", value=res.stdout, height=180)
+    if res.stderr.strip():
+        st.text_area("stderr", value=res.stderr, height=180)
+    if res.returncode == 0:
+        st.success("OK")
+    else:
+        st.error(f"Failed (returncode={res.returncode})")
+
+
+def default_config() -> Dict[str, Any]:
+    return {
+        # directory layout A
+        "inputs_dir": "inputs",
+        "tiles_dir": "tiles",
+        "outputs_dir": "outputs",
+        "coco_dir": "coco_valid",
+        "coco_json": "coco_valid/_annotations.coco.json",
+
+        # roboflow
+        "api_key": os.getenv("ROBOFLOW_API_KEY", ""),
+        "model": "window-door-demo",
+        "version": "4",
+
+        # step1 tile
+        "tile_size": 640,
+        "overlap": 0.2,
+        "pad_mode": "pad",
+        "pad_color": "white",
+        "flat_tiles": False,
+
+        # step3 infer(full)
+        "step3_input_image": "inputs/input.png",
+        "step3_tiles_dir": "tiles/input",
+        "step3_out_dir": "outputs/full_infer",
+        "conf": 0.6,
+        "nms_iou": 0.5,
+        "skip_white_tiles": True,
+        "tile_white_thr": 245,
+        "tile_white_ratio": 0.98,
+        "filter_big_box": False,
+        "big_box_area_ratio": 0.15,
+        "big_box_keep_conf": 0.95,
+
+        # step2 infer(coco tiles)
+        "step2_out_dir": "outputs/coco_infer",
+        "step2_conf": 0.6,
+        "step2_max_tiles": 0,
+
+        # step4 eval
+        "eval_out_dir": "outputs/eval",
+        "eval_iou": 0.5,
+        "eval_cls": "window",
+        "eval_pred_coord": "auto",
+    }
+
+
+def main() -> None:
+    st.set_page_config(page_title="Roboflow Pipeline UI", layout="wide")
+    st.title("Roboflow Tile Pipeline UI")
+    st.caption("Directory layout A + Default flow ③ (Step2 COCO infer -> Step4 eval)")
+
+    state = config_store.load(default_config())
+    cfg: Dict[str, Any] = state["config"]
+    last_result: Dict[str, Any] = state.get("last_result", {})
+
+    with st.sidebar:
+        st.header("Global")
+        cfg["api_key"] = st.text_input("Roboflow API Key", value=cfg.get("api_key", ""), type="password")
+        cfg["model"] = st.text_input("Model", value=cfg.get("model", ""))
+        cfg["version"] = st.text_input("Version", value=str(cfg.get("version", "")))
+
+        st.divider()
+        st.subheader("Folders")
+        cfg["inputs_dir"] = st.text_input("inputs_dir", value=cfg.get("inputs_dir", "inputs"))
+        cfg["tiles_dir"] = st.text_input("tiles_dir", value=cfg.get("tiles_dir", "tiles"))
+        cfg["outputs_dir"] = st.text_input("outputs_dir", value=cfg.get("outputs_dir", "outputs"))
+        cfg["coco_dir"] = st.text_input("coco_dir", value=cfg.get("coco_dir", "coco_valid"))
+        cfg["coco_json"] = st.text_input("coco_json", value=cfg.get("coco_json", "coco_valid/_annotations.coco.json"))
+
+        st.divider()
+        st.subheader("Save")
+        if st.button("Save settings", use_container_width=True):
+            config_store.save(cfg, last_result=last_result)
+            st.success("Saved to state/last_run.json")
+
+        if last_result:
+            st.caption("Last result")
+            st.json(last_result)
+
+    # ensure basic folders
+    ensure_dir(cfg["inputs_dir"])
+    ensure_dir(cfg["tiles_dir"])
+    ensure_dir(cfg["outputs_dir"])
+
+    st.caption(f"Project root: {PROJECT_ROOT}")
+
+    tab_flow, tab_setup, tab_s1, tab_s3, tab_s2, tab_s4, tab_review = st.tabs(
+        [
+            "Flow ③ (recommended)",
+            "Setup check",
+            "Step1 Tile",
+            "Step3 Infer full",
+            "Step2 Infer COCO tiles",
+            "Step4 Eval",
+            "Review (FP/FN)",
+        ]
+    )
+
+    # ----------------- Flow ③ -----------------
+    with tab_flow:
+        st.subheader("Default flow ③")
+        st.write("Step2: infer coco_valid tiles -> Step4: evaluate vs COCO GT")
+
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            run_btn = st.button("Run flow ③", type="primary")
+        with col2:
+            if st.button("Open eval folder"):
+                open_folder(cfg["eval_out_dir"])
+        with col3:
+            st.write("Use this after you exported COCO (coco_valid) from Roboflow.")
+
+        if run_btn:
+            step2_script = str(PROJECT_ROOT / "pipeline" / "steps" / "step2_infer_coco_tiles_cli.py")
+            step4_script = str(PROJECT_ROOT / "legacy" / "step4_tile_eval.py")
+
+            step2_args = [
+                "--api_key",
+                cfg["api_key"],
+                "--model",
+                cfg["model"],
+                "--version",
+                str(cfg["version"]),
+                "--coco",
+                cfg["coco_json"],
+                "--coco_dir",
+                cfg["coco_dir"],
+                "--out_dir",
+                cfg["step2_out_dir"],
+                "--conf",
+                str(cfg["step2_conf"]),
+                "--max_tiles",
+                str(int(cfg.get("step2_max_tiles", 0))),
+            ]
+            r2 = run_py(step2_script, step2_args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step2", r2)
+
+            pred_path = str(Path(cfg["step2_out_dir"]) / "pred_tiles.json")
+            step4_args = [
+                "--coco",
+                cfg["coco_json"],
+                "--pred",
+                pred_path,
+                "--out",
+                cfg["eval_out_dir"],
+                "--iou",
+                str(cfg["eval_iou"]),
+                "--cls",
+                cfg["eval_cls"],
+                "--tile_size",
+                str(int(cfg["tile_size"])),
+                "--pred_coord",
+                "tile",
+            ]
+            r4 = run_py(step4_script, step4_args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step4", r4)
+
+            last_result = {"flow": "③", "pred": pred_path, "eval_out": cfg["eval_out_dir"]}
+            config_store.save(cfg, last_result=last_result)
+
+        st.markdown(
+            """
+**Outputs you should care about**
+- Step2: `outputs/coco_infer/pred_tiles.json`
+- Step4: `outputs/eval/`
+  - `eval_report.json`, `eval_report.csv`
+  - `false_positives.json`, `false_negatives.json`
+  - `tile_overlay/` (each tile: GT/Pred/FP/FN overlay)
+
+**Next iteration loop (your goal)**
+1) Open `tile_overlay/` and inspect top FP/FN tiles
+2) Decide: model issue vs labeling / class definition issue
+3) Add hard cases / negatives, retrain in Roboflow
+4) Re-run flow ③ and compare metrics
+"""
+        )
+
+    # ----------------- Setup -----------------
+    with tab_setup:
+        st.subheader("Quick setup check")
+        st.write("Put original images into inputs/. Put Roboflow COCO export into coco_valid/.")
+
+        imgs = list_images(cfg["inputs_dir"])
+        st.write(f"inputs images: {len(imgs)}")
+        if imgs:
+            st.write([p.name for p in imgs[:30]])
+
+        coco_json_path = Path(cfg["coco_json"])
+        st.write(f"coco_json exists: {coco_json_path.exists()} ({coco_json_path})")
+        if st.button("Open inputs folder"):
+            open_folder(cfg["inputs_dir"])
+        if st.button("Open coco_valid folder"):
+            open_folder(cfg["coco_dir"])
+
+    # ----------------- Step1 -----------------
+    with tab_s1:
+        st.subheader("Step1: tile original images")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            cfg["tile_size"] = st.number_input("tile_size", min_value=128, max_value=2048, value=int(cfg["tile_size"]), step=32)
+        with c2:
+            cfg["overlap"] = st.slider("overlap", min_value=0.0, max_value=0.9, value=float(cfg["overlap"]), step=0.05)
+        with c3:
+            cfg["pad_mode"] = st.selectbox("pad_mode", ["skip", "pad"], index=0 if cfg["pad_mode"] == "skip" else 1)
+        with c4:
+            cfg["pad_color"] = st.selectbox("pad_color", ["white", "black"], index=0 if cfg["pad_color"] == "white" else 1)
+
+        cfg["flat_tiles"] = st.checkbox("flat output (no per-image subfolder)", value=bool(cfg.get("flat_tiles", False)))
+
+        if st.button("Run Step1", type="primary"):
+            step1_script = str(PROJECT_ROOT / "pipeline" / "steps" / "step1_tile_cli.py")
+            args = [
+                "--input_dir",
+                cfg["inputs_dir"],
+                "--out_dir",
+                cfg["tiles_dir"],
+                "--tile_size",
+                str(int(cfg["tile_size"])),
+                "--overlap",
+                str(float(cfg["overlap"])),
+                "--pad_mode",
+                cfg["pad_mode"],
+                "--pad_color",
+                cfg["pad_color"],
+            ]
+            if cfg.get("flat_tiles", False):
+                args.append("--flat")
+
+            res = run_py(step1_script, args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step1", res)
+            last_result = {"step": 1, "tiles_dir": cfg["tiles_dir"]}
+            config_store.save(cfg, last_result=last_result)
+
+        cA, cB = st.columns(2)
+        with cA:
+            if st.button("Open tiles folder"):
+                open_folder(cfg["tiles_dir"])
+        with cB:
+            if st.button("Open inputs folder (again)"):
+                open_folder(cfg["inputs_dir"])
+
+    # ----------------- Step3 -----------------
+    with tab_s3:
+        st.subheader("Step3: infer any original image by tiles -> merge -> draw")
+        st.write("Typical use: infer a NEW image (not necessarily in training set).")
+
+        cfg["step3_input_image"] = st.text_input("input_image", value=cfg.get("step3_input_image", "inputs/input.png"))
+        cfg["step3_tiles_dir"] = st.text_input("tiles_dir", value=cfg.get("step3_tiles_dir", "tiles/input"))
+        cfg["step3_out_dir"] = st.text_input("out_dir", value=cfg.get("step3_out_dir", "outputs/full_infer"))
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            cfg["conf"] = st.slider("confidence", min_value=0.0, max_value=1.0, value=float(cfg["conf"]), step=0.01)
+        with d2:
+            cfg["nms_iou"] = st.slider("nms_iou", min_value=0.0, max_value=1.0, value=float(cfg["nms_iou"]), step=0.01)
+        with d3:
+            cfg["skip_tiles_mode"] = st.selectbox(
+                "skip tiles mode",
+                options=["OFF", "SAFE", "FAST"],
+                index={"OFF": 0, "SAFE": 1, "FAST": 2}.get(str(cfg.get("skip_tiles_mode", "SAFE")).upper(), 1),
+                help=(
+                    "OFF: do not skip any tiles.\n"
+                    "SAFE: very conservative (recommended) - avoids false skipping small corner objects.\n"
+                    "FAST: skips more aggressively (can miss tiny objects)."
+                ),
+            )
+
+        # Advanced thresholds for the tile skipping heuristic
+        if str(cfg.get("skip_tiles_mode", "SAFE")).upper() != "OFF":
+            with st.expander("Tile skipping advanced thresholds", expanded=False):
+                # Recommend defaults per mode, but allow manual overrides.
+                mode = str(cfg.get("skip_tiles_mode", "SAFE")).upper()
+                rec_nonwhite = 0.0005 if mode == "SAFE" else 0.003
+                rec_edge = 0.0002 if mode == "SAFE" else 0.001
+                cfg["tile_white_thr"] = st.slider(
+                    "white_thr (0..255)",
+                    min_value=200,
+                    max_value=255,
+                    value=int(cfg.get("tile_white_thr", 245)),
+                    step=1,
+                    help="Pixels brighter than this are treated as 'white-ish'.",
+                )
+                cfg["min_nonwhite_ratio"] = st.slider(
+                    "min_nonwhite_ratio (0..0.01)",
+                    min_value=0.0,
+                    max_value=0.01,
+                    value=float(cfg.get("min_nonwhite_ratio", rec_nonwhite)),
+                    step=0.0001,
+                    format="%.4f",
+                    help="Skip tile only if its non-white pixel ratio is below this.",
+                )
+                cfg["min_edge_ratio"] = st.slider(
+                    "min_edge_ratio (0..0.01)",
+                    min_value=0.0,
+                    max_value=0.01,
+                    value=float(cfg.get("min_edge_ratio", rec_edge)),
+                    step=0.0001,
+                    format="%.4f",
+                    help="Skip tile only if its edge pixel ratio is below this.",
+                )
+
+        cfg["filter_big_box"] = st.checkbox("filter_big_box", value=bool(cfg.get("filter_big_box", False)))
+
+        if st.button("Run Step3", type="primary"):
+            step3_script = str(PROJECT_ROOT / "pipeline" / "steps" / "step3_infer_full_cli.py")
+            args = [
+                "--api_key",
+                cfg["api_key"],
+                "--model",
+                cfg["model"],
+                "--version",
+                str(cfg["version"]),
+                "--input_image",
+                cfg["step3_input_image"],
+                "--tiles_dir",
+                cfg["step3_tiles_dir"],
+                "--out_dir",
+                cfg["step3_out_dir"],
+                "--conf",
+                str(cfg["conf"]),
+                "--nms_iou",
+                str(cfg["nms_iou"]),
+            ]
+
+            # New, more stable tile skipping strategy (OFF/SAFE/FAST)
+            mode = str(cfg.get("skip_tiles_mode", "SAFE")).lower()
+            if mode != "off":
+                args += ["--skip_tiles_mode", mode]
+                args += ["--tile_white_thr", str(int(cfg.get("tile_white_thr", 245)))]
+                args += ["--min_nonwhite_ratio", str(float(cfg.get("min_nonwhite_ratio", 0.0005 if mode == "safe" else 0.003)))]
+                args += ["--min_edge_ratio", str(float(cfg.get("min_edge_ratio", 0.0002 if mode == "safe" else 0.001)))]
+
+            if cfg.get("filter_big_box", False):
+                args.append("--filter_big_box")
+                args += ["--big_box_area_ratio", str(float(cfg.get("big_box_area_ratio", 0.15)))]
+                args += ["--big_box_keep_conf", str(float(cfg.get("big_box_keep_conf", 0.95)))]
+
+            res = run_py(step3_script, args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step3", res)
+
+            out_img = Path(cfg["step3_out_dir"]) / "result_drawn.png"
+            if out_img.exists():
+                st.image(str(out_img), caption=str(out_img), use_container_width=True)
+
+            last_result = {"step": 3, "out_dir": cfg["step3_out_dir"], "pred": str(Path(cfg["step3_out_dir"]) / "result_boxes_raw.json")}
+            config_store.save(cfg, last_result=last_result)
+
+        if st.button("Open Step3 out folder"):
+            open_folder(cfg["step3_out_dir"])
+
+    # ----------------- Step2 -----------------
+    with tab_s2:
+        st.subheader("Step2: infer COCO tiles")
+        cfg["step2_out_dir"] = st.text_input("out_dir", value=cfg.get("step2_out_dir", "outputs/coco_infer"))
+        cfg["step2_conf"] = st.slider("conf", min_value=0.0, max_value=1.0, value=float(cfg.get("step2_conf", 0.6)), step=0.01)
+        cfg["step2_max_tiles"] = st.number_input("max_tiles (0=all)", min_value=0, value=int(cfg.get("step2_max_tiles", 0)), step=10)
+
+        if st.button("Run Step2", type="primary"):
+            step2_script = str(PROJECT_ROOT / "pipeline" / "steps" / "step2_infer_coco_tiles_cli.py")
+            args = [
+                "--api_key",
+                cfg["api_key"],
+                "--model",
+                cfg["model"],
+                "--version",
+                str(cfg["version"]),
+                "--coco",
+                cfg["coco_json"],
+                "--coco_dir",
+                cfg["coco_dir"],
+                "--out_dir",
+                cfg["step2_out_dir"],
+                "--conf",
+                str(cfg["step2_conf"]),
+                "--max_tiles",
+                str(int(cfg["step2_max_tiles"])),
+            ]
+            res = run_py(step2_script, args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step2", res)
+            last_result = {"step": 2, "out_dir": cfg["step2_out_dir"], "pred": str(Path(cfg["step2_out_dir"]) / "pred_tiles.json")}
+            config_store.save(cfg, last_result=last_result)
+
+        if st.button("Open Step2 out folder"):
+            open_folder(cfg["step2_out_dir"])
+
+    # ----------------- Step4 -----------------
+    with tab_s4:
+        st.subheader("Step4: evaluate pred json vs COCO GT")
+        cfg["eval_out_dir"] = st.text_input("eval_out_dir", value=cfg.get("eval_out_dir", "outputs/eval"))
+        cfg["eval_iou"] = st.slider("IoU", min_value=0.0, max_value=0.95, value=float(cfg.get("eval_iou", 0.5)), step=0.05)
+        cfg["eval_cls"] = st.text_input("target class", value=cfg.get("eval_cls", "window"))
+
+        pred_from_step2 = str(Path(cfg.get("step2_out_dir", "outputs/coco_infer")) / "pred_tiles.json")
+        pred_from_step3 = str(Path(cfg.get("step3_out_dir", "outputs/full_infer")) / "result_boxes_raw.json")
+
+        choice = st.radio(
+            "pred source",
+            options=["Step2 pred_tiles.json (tile coord)", "Step3 result_boxes_raw.json (global coord)", "Custom"],
+            index=0,
+            horizontal=True,
+        )
+
+        if choice.startswith("Step2"):
+            pred_path = st.text_input("pred", value=pred_from_step2)
+            pred_coord = "tile"
+        elif choice.startswith("Step3"):
+            pred_path = st.text_input("pred", value=pred_from_step3)
+            pred_coord = "global"
+        else:
+            pred_path = st.text_input("pred", value=cfg.get("eval_pred", pred_from_step2))
+            pred_coord = st.selectbox("pred_coord", ["auto", "tile", "global"], index=["auto", "tile", "global"].index(cfg.get("eval_pred_coord", "auto")))
+            cfg["eval_pred"] = pred_path
+            cfg["eval_pred_coord"] = pred_coord
+
+        if st.button("Run Step4", type="primary"):
+            step4_script = str(PROJECT_ROOT / "legacy" / "step4_tile_eval.py")
+            args = [
+                "--coco",
+                cfg["coco_json"],
+                "--pred",
+                pred_path,
+                "--out",
+                cfg["eval_out_dir"],
+                "--iou",
+                str(cfg["eval_iou"]),
+                "--cls",
+                cfg["eval_cls"],
+                "--tile_size",
+                str(int(cfg["tile_size"])),
+                "--pred_coord",
+                pred_coord,
+            ]
+            res = run_py(step4_script, args, cwd=str(PROJECT_ROOT))
+            show_cmd("Step4", res)
+            last_result = {"step": 4, "pred": pred_path, "pred_coord": pred_coord, "eval_out": cfg["eval_out_dir"]}
+            config_store.save(cfg, last_result=last_result)
+
+        st.markdown(
+            """
+**Step4 input principle**
+- COCO GT (`_annotations.coco.json`) provides GT boxes in tile-local coordinates.
+- Pred json is grouped by the same tile_name/file_name.
+- Step4 matches GT vs Pred by IoU >= threshold and outputs TP/FP/FN.
+
+If you evaluate Step3 output (global coords), Step4 converts to tile coords internally when `--pred_coord global`.
+"""
+        )
+
+    # ----------------- Review -----------------
+    with tab_review:
+        st.subheader("Artifacts + FP/FN browser")
+
+        eval_dir = Path(cfg.get("eval_out_dir", "outputs/eval"))
+        report_json = eval_dir / "eval_report.json"
+        report_csv = eval_dir / "eval_report.csv"
+        fp_json = eval_dir / "false_positives.json"
+        fn_json = eval_dir / "false_negatives.json"
+        overlay_dir = eval_dir / "tile_overlay"
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.code(str(eval_dir))
+        with c2:
+            if st.button("Open eval dir"):
+                open_folder(str(eval_dir))
+        with c3:
+            if st.button("Open overlay dir"):
+                open_folder(str(overlay_dir))
+
+        if report_json.exists():
+            rep = read_json(report_json)
+            totals = rep.get("totals", {})
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("TP", int(totals.get("tp", 0)))
+            m2.metric("FP", int(totals.get("fp", 0)))
+            m3.metric("FN", int(totals.get("fn", 0)))
+            m4.metric("F1", float(totals.get("f1", 0.0)))
+
+        if report_csv.exists():
+            df = pd.read_csv(report_csv)
+            st.dataframe(df.head(300), use_container_width=True)
+
+        st.markdown("### Interactive browser")
+        kind = st.selectbox("type", ["FP", "FN"], index=0)
+        target_path = fp_json if kind == "FP" else fn_json
+
+        if target_path.exists():
+            rows = read_json(target_path)
+            if isinstance(rows, list) and rows:
+                dfr = pd.DataFrame(rows)
+                if "confidence" in dfr.columns:
+                    dfr = dfr.sort_values("confidence", ascending=False)
+                st.dataframe(dfr.head(200), use_container_width=True)
+
+                tile_name = st.text_input("tile_name to preview", value=str(rows[0].get("tile_name", "")))
+                if tile_name:
+                    img_path = overlay_dir / f"{tile_name}.jpg"
+                    if img_path.exists():
+                        st.image(str(img_path), caption=str(img_path), use_container_width=True)
+                    else:
+                        st.warning("overlay image not found for this tile_name")
+
+        st.markdown(
+            """
+### Coordinate reminder
+- COCO GT stores bbox as `[x, y, w, h]` (tile-local).
+- In eval outputs we commonly use `xyxy = [x1, y1, x2, y2]`.
+
+**How to locate a specific FN/FP by coordinates?**
+1) Fastest: open `tile_overlay/<tile_name>.jpg` and visually confirm.
+2) If you want the exact location: open the corresponding tile image in `coco_valid/` and use the bbox numbers.
+
+**Why FP/FN can be labeling/class-definition issues?**
+- If GT missed a tiny window near border, model predicts it: that becomes FP, but actually GT is incomplete.
+- If "window" definition is ambiguous (thin slit vs vent vs frame), same location can flip between FP/FN.
+"""
+        )
+
+
+if __name__ == "__main__":
+    main()
