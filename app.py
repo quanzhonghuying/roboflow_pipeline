@@ -140,6 +140,47 @@ def save_uploaded_file_to_tmp(uploaded, out_dir: str) -> str:
 
 
 # ----------------------------
+# extra helpers (compat)
+# ----------------------------
+
+from typing import Any, Dict, List, Tuple
+
+
+def save_cfg(cfg: Dict[str, Any]) -> None:
+    """互換: 旧コードの save_cfg()。UIの設定を保存するだけ。"""
+    try:
+        save_last_config(cfg)
+    except Exception:
+        # 保存失敗は致命的ではない
+        pass
+
+
+def list_json(folder: str) -> List[str]:
+    """folder 配下の *.json を、UIで使いやすい相対パス一覧で返す。"""
+    try:
+        base = Path(folder)
+        if not base.exists():
+            return []
+        items = sorted(base.rglob("*.json"))
+        # ここでは実行ディレクトリ相対（app.py から見える）で返す
+        return [str(i).replace("\\", "/") for i in items]
+    except Exception:
+        return []
+
+
+def run_and_show(cmd: List[str]) -> Tuple[bool, str]:
+    """互換: 旧UIの run_and_show()。CLI を実行して結果を表示する。"""
+    ok, out = run_cli(cmd)
+    # Streamlitの表示
+    st.code("$ " + " ".join(cmd) + "\n" + out)
+    if ok:
+        st.success("完了")
+    else:
+        st.error("失敗")
+    return ok, out
+
+
+# ----------------------------
 # UI
 # ----------------------------
 
@@ -572,8 +613,18 @@ def tab_step4(cfg: Dict[str, Any]) -> None:
         help="Step2 の pred_tiles.json（タイル座標）か、Step3 の raw json（原図座標）を選びます。",
     )
 
-    # pred 座標系
-    pred_coord = "tile" if pred_path.endswith("pred_tiles.json") else "global"
+    # pred 座標系（Step2 は tile-local、Step3 raw は global が基本）
+    guess_coord = "tile" if str(pred_path).endswith("pred_tiles.json") else "global"
+    pred_coord = st.selectbox(
+        "pred の座標系",
+        options=["tile", "global", "auto"],
+        index=["tile", "global", "auto"].index(guess_coord),
+        help=(
+            "Step2 の pred_tiles.json は通常 tile（0..tile_size）です。\n"
+            "Step3 の result_boxes_raw.json は通常 global（原図座標）です。\n"
+            "auto は混在/不明のときに試します。"
+        ),
+    )
 
     if st.button("Step4 を実行", key="btn_10"):
         cmd = [
@@ -587,7 +638,7 @@ def tab_step4(cfg: Dict[str, Any]) -> None:
             cfg["eval_out_dir"],
             "--iou",
             str(cfg["iou"]),
-            "--pred_coord",
+            "--coord",
             pred_coord,
             "--cls",
             cfg["eval_cls"],
@@ -635,11 +686,21 @@ def tab_review(cfg: Dict[str, Any]) -> None:
 
     if fp.exists():
         st.markdown("#### false_positives（FP）")
-        st.write(f"件数: {len(json.loads(fp.read_text(encoding='utf-8')))}")
+        obj, err = safe_read_json(fp)
+        if err:
+            st.warning(f"fp.json is not readable: {err}")
+        else:
+            st.write(f"件数: {len(obj)}")
+            st.json(obj)
 
     if fn.exists():
         st.markdown("#### false_negatives（FN）")
-        st.write(f"件数: {len(json.loads(fn.read_text(encoding='utf-8')))}")
+        obj, err = safe_read_json(fn)
+        if err:
+            st.warning(f"fn.json is not readable: {err}")
+        else:
+            st.write(f"件数: {len(obj)}")
+            st.json(obj)
 
 
 def tab_flow3(cfg: Dict[str, Any]) -> None:
@@ -731,7 +792,7 @@ def tab_flow3(cfg: Dict[str, Any]) -> None:
                     "--iou",
                     str(cfg["iou"]),
                     "--pred_coord",
-                    "tile",
+                    "auto",
                     "--cls",
                     cfg["eval_cls"],
                     "--tile_size",

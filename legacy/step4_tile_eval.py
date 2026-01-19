@@ -119,6 +119,56 @@ def canonical_tile_key_from_origin(x0: int, y0: int) -> str:
     return f"tile_x{x0}_y{y0}.png"
 
 
+# -------------------------
+# 画像キー正規化（COCO / Pred の突き合わせ用）
+# -------------------------
+
+_RE_TILE_KEY = re.compile(r"(tile_x\d+_y\d+)")
+
+
+def normalize_image_key(s: str) -> str:
+    """COCO の file_name / パス文字列を、突き合わせ用の安定キーへ正規化する。
+
+    このプロジェクトでは tile 画像名が以下のように複数の揺れを持ちうる：
+      - tiles/APW330.../tile_x512_y0.png
+      - tile_x512_y0.png.rf.<hash>
+      - tile_x512_y0.png (COCO)
+
+    正規化ルール：
+      1) 文字列中に tile_x*_y* が含まれる場合は、その部分を抽出して
+         "tile_x{X}_y{Y}.png" に統一。
+      2) そうでない場合は basename を取り、拡張子と ".rf.<hash>" を除去。
+    """
+
+    if s is None:
+        return ""
+
+    s2 = str(s).replace("\\", "/")
+    m = _RE_TILE_KEY.search(s2)
+    if m:
+        return f"{m.group(1)}.png"
+
+    base = os.path.basename(s2)
+    stem, _ext = os.path.splitext(base)
+    # Roboflow が付与する .rf.<hash> を除去
+    if ".rf." in stem:
+        stem = stem.split(".rf.", 1)[0]
+    return stem
+
+
+def tile_origin_from_name(s: str) -> tuple[int, int]:
+    """正規化後/前の文字列から tile origin (x0,y0) を抽出する。
+
+    例: "tile_x512_y0.png" / "tile_x512_y0" / ".../tile_x512_y0.png.rf.xxx"
+    """
+
+    key = normalize_image_key(s)
+    m = re.search(r"tile_x(\d+)_y(\d+)", key)
+    if not m:
+        return 0, 0
+    return int(m.group(1)), int(m.group(2))
+
+
 def canonical_tile_key_from_any(name: str) -> Optional[str]:
     origin = parse_tile_origin(name)
     if not origin:
@@ -342,6 +392,67 @@ def assign_tile_by_center_global(x1, y1, x2, y2, tile_size: int) -> Tuple[int, i
     return ox, oy
 
 
+def build_coco_tile_origin_index(
+    coco: Dict[str, Any],
+) -> List[Tuple[int, int, int, int, str]]:
+    """COCO images から tile の (origin_x, origin_y, w, h, tile_key) を収集する。
+
+    目的:
+      - overlap や padding で origin が等間隔とは限らないケースでも、
+        pred の global bbox center を最も自然な tile に割り当てる。
+
+    戻り値:
+      - [(ox, oy, w, h, tile_key), ...]
+    """
+    idx: List[Tuple[int, int, int, int, str]] = []
+    for img in coco.get("images", []):
+        fn = str(img.get("file_name", ""))
+        base = normalize_image_key(fn)
+        # tile origin
+        ox, oy = tile_origin_from_name(base)
+        w = int(img.get("width", 0) or 0)
+        h = int(img.get("height", 0) or 0)
+        if ox is None or oy is None:
+            continue
+        if w <= 0 or h <= 0:
+            # width/height が無い場合は後で tile_size_guess を使う
+            w = 0
+            h = 0
+        idx.append((int(ox), int(oy), int(w), int(h), base))
+    return idx
+
+
+def assign_tile_by_center_with_coco_index(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    coco_idx: List[Tuple[int, int, int, int, str]],
+    fallback_tile_size: int,
+) -> Tuple[int, int]:
+    """COCO の tile origin 一覧を使って、中心点を含む tile を探す。
+
+    見つからない場合は fallback として floor(center / fallback_tile_size) を使う。
+    """
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    # 1) まずは「中心点を含む」tile を探す
+    for ox, oy, w, h, _key in coco_idx:
+        tw = w if w > 0 else fallback_tile_size
+        th = h if h > 0 else fallback_tile_size
+        if ox <= cx < ox + tw and oy <= cy < oy + th:
+            return ox, oy
+
+    # 2) なければ「中心点に最も近い origin」を選ぶ (頑健化)
+    if coco_idx:
+        best = min(coco_idx, key=lambda t: (abs(cx - t[0]) + abs(cy - t[1])))
+        return best[0], best[1]
+
+    # 3) 最後の砦: 均等グリッド仮定
+    return assign_tile_by_center_global(x1, y1, x2, y2, fallback_tile_size)
+
+
 # -------------------------
 # 描画
 # -------------------------
@@ -430,6 +541,11 @@ def main():
     coco = load_json(args.coco)
     idx = build_coco_index(coco)
 
+    # COCO 側に含まれるタイル原点の一覧。
+    # UI版では Step2 の pred が "global" 座標で来ることが多く、かつ overlap/pad の都合で
+    # "中心を tile_size で割る" 方式だとズレるケースがあるため、COCO 由来の原点一覧で割り当てる。
+    coco_tile_idx = build_coco_tile_origin_index(coco)
+
     coco_dir = os.path.dirname(os.path.abspath(args.coco))
 
     pred_obj = load_json(args.pred)
@@ -490,9 +606,19 @@ def main():
             hint = pred_tile_hint(p)
 
             if coord_mode == "global":
-                # tile_name が間違うことがあるので、中心から tile を決める
-                ox, oy = assign_tile_by_center_global(x1, y1, x2, y2, tile_size_guess)
-                tile_key = canonical_tile_key_from_origin(ox, oy)
+                # 1) まず pred 側の tile ヒント（tile_x.._y..）があればそれを優先
+                hinted = canonical_tile_key_from_any(hint)
+                if hinted is not None:
+                    ox, oy = extract_tile_origin(hinted)
+                    tile_key = canonical_tile_key_from_origin(ox, oy)
+                else:
+                    # 2) ヒントがない場合は COCO の原点一覧で中心点が入るタイルを探す（最優先）
+                    ox, oy = assign_tile_by_center_with_coco_index(
+                        x1, y1, x2, y2, coco_tile_idx, tile_size_guess
+                    )
+                    tile_key = canonical_tile_key_from_origin(ox, oy)
+
+                # global → tile-local
                 x1, y1, x2, y2 = x1 - ox, y1 - oy, x2 - ox, y2 - oy
             else:
                 tile_key = canonical_tile_key_from_any(
